@@ -1,0 +1,14 @@
+{
+  "name": "Crowd Control Support",
+  "author": "Aidanamite",
+  "description": "This mod is designed for use with Crowd Control",
+  "version": "1.2.4",
+  "license": "GNU AGPLv3",
+  "icon": "icon.png",
+  "banner": "banner.jpg",
+  "gameVersion": "1.0",
+  "requiredByAllPlayers": false,
+  "updateUrl": "https://www.raftmodding.com/api/v1/mods/crowd-control-support/version.txt",
+  "isModPermanent": true,
+  "excludedFiles": []
+}

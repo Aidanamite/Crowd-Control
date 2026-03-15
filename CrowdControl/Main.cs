@@ -17,6 +17,10 @@ using UnityEngine.AzureSky;
 using UnityEngine.UI;
 using Debug = UnityEngine.Debug;
 using Object = UnityEngine.Object;
+using static CrowdControl.Main;
+using RTCP.Steam.Networking;
+using System.Runtime.InteropServices.ComTypes;
+using Newtonsoft.Json.Linq;
 
 
 namespace CrowdControl
@@ -24,8 +28,8 @@ namespace CrowdControl
     public class Main : Mod
     {
         public const string prefKey = "mod_CrowdControl_hasLoadedBefore";
-        static TcpClient client;
-        static NetworkStream stream;
+        public static TcpClient client;
+        public static NetworkStream stream;
         public static string prefix = "[Crowd Control Support]: ";
         public static System.Random rand = new System.Random();
         public static ChunkPoint spawnChunk;
@@ -41,6 +45,7 @@ namespace CrowdControl
         public static bool logNetworking = false;
         Harmony harmony;
         bool loaded = false;
+        public static Main instance;
         public void Awake()
         {
             modlistEntry.jsonmodinfo.isModPermanent = false;
@@ -48,6 +53,7 @@ namespace CrowdControl
             if (!ModManagerPage.OnStartUserPermanentMods.list.Contains(filename) && PlayerPrefs.HasKey(prefKey))
                 return;
             loaded = true;
+            instance = this;
             if (!PlayerPrefs.HasKey(prefKey))
             {
                 ModManagerPage.OnStartUserPermanentMods.list.Add(filename);
@@ -73,6 +79,20 @@ namespace CrowdControl
             Log("Mod has been loaded!");
         }
 
+        public override bool OnNetworkMessage(object message, Network_UserId from, string modslug)
+        {
+            if (logNetworking)
+                Debug.Log("Recieved message on mod's network channel " + message.ToString());
+            if (message is CustomMessage msg)
+            {
+                if (logNetworking)
+                    Debug.Log("Recieved message type: " + msg.GetType().FullName);
+                msg.Execute(from);
+                return true;
+            }
+            return base.OnNetworkMessage(message, from, modslug);
+        }
+
         public void Update()
         {
             if (!loaded)
@@ -82,50 +102,6 @@ namespace CrowdControl
             }
             ClientUpdate();
             float timeDif = Time.deltaTime;
-            var message = RAPI.ListenForNetworkMessagesOnChannel(MessageType.ChannelID);
-            if (message != null)
-            {
-                if (logNetworking)
-                    Debug.Log("Recieved message on mod's network channel with id " + message.message.Type);
-                if (message.message.Type == MessageType.MessageID)
-                {
-                    var msg = message.message as Message_InitiateConnection;
-                    if (logNetworking)
-                        Debug.Log("Recieved message type: " + msg.appBuildID);
-                    if (msg.appBuildID == MessageType.Execute)
-                    {
-                        var info = new Message_ExecuteEvent(msg);
-                        if (info.MessageID > -1)
-                            eventRequest = (message.steamid, info.MessageID, info.Duration);
-                        ExecuteEvent(info.EventID);
-                        eventRequest = null;
-                    }
-                    else if (msg.appBuildID == MessageType.Executed && client.Connected)
-                    {
-                        var info = new Message_EventExecuted(msg);
-                        if (logNetworking)
-                            Debug.Log("Recieved event reply");
-                        foreach (AnimalEffect item in spawnedAnimals)
-                            if (item.id == info.MessageID)
-                                item.animalId = info.ExtraData;
-                        byte[] responce = Encoding.UTF8.GetBytes("{\"id\":" + info.MessageID + ",\"status\":" + (int)EffectResult.Success + ",\"message\":\"Event was executed\",\"type\":0}");
-                        byte[] final = new byte[responce.Length + 1];
-                        responce.CopyTo(final, 0);
-                        if (client.Connected)
-                            stream.Write(final, 0, final.Length);
-                    }
-                    else if (msg.appBuildID == MessageType.Wind)
-                    {
-                        var info = new Message_Wind(msg);
-                        windDirection = new Vector4((float)Math.Sin(info.Angle), 0, (float)Math.Cos(info.Angle), info.Time);
-                    }
-                    else if (msg.appBuildID == MessageType.Upgrade)
-                    {
-                        uint ObjectIndex = new Message_Upgrade(msg).ObjectIndex;
-                        BlockCreator.GetPlacedBlocks().Find((Block b) => b.ObjectIndex == ObjectIndex).Reinforced = true;
-                    }
-                }
-            }
             if (RAPI.GetLocalPlayer() == null)
             {
                 if (spawnChunk != null)
@@ -183,6 +159,7 @@ namespace CrowdControl
         {
             if (!loaded)
                 return;
+            instance = null;
             if (client != null)
                 client.Dispose();
             harmony?.UnpatchAll(harmony.Id);
@@ -191,8 +168,7 @@ namespace CrowdControl
 
         public static void sendMessage(Message msg)
         {
-            Raft_Network network = RAPI.GetLocalPlayer().Network;
-            network.SendP2P(network.HostID, msg, EP2PSend.k_EP2PSendReliable, MessageType.Channel);
+            instance.SendNetworkMessageToPlayer(msg, ComponentManager<Raft_Network>.Value.HostID);
         }
 
         public static void sendReply(int extra = -1)
@@ -200,14 +176,14 @@ namespace CrowdControl
             if (logNetworking)
                 Debug.Log("Sending Reply");
             if (eventRequest != null)
-                new Message_EventExecuted(eventRequest.messageId, extra).Message.SendP2P(eventRequest.sender, MessageType.Channel);
+                new Message_EventExecuted(eventRequest.messageId, extra).SendP2P(eventRequest.sender);
         }
 
         public static void sendRequest(string eventID)
         {
             if (logNetworking)
                 Debug.Log("sending request " + eventID);
-            new Message_ExecuteEvent(events.IndexOf(eventID), eventRequest.messageId, eventRequest.duration).Message.Broadcast(MessageType.Channel);
+            new Message_ExecuteEvent(events.IndexOf(eventID), eventRequest.messageId, eventRequest.duration).Broadcast();
         }
 
         public static void ClientUpdate()
@@ -224,26 +200,26 @@ namespace CrowdControl
                         bytes.Add(data);
                 }
                 string str = Encoding.UTF8.GetString(bytes.ToArray());
-                JSONObject msg;
+                JObject msg;
                 int msgID;
                 try
                 {
                     byte[] responce = null;
-                    msg = new JSONObject(str);
+                    msg = JObject.Parse(str);
                     if (logNetworking)
                         Debug.Log("Recieved message from crowd control: " + str);
-                    msgID = (int)msg.GetField("id").n;
+                    msgID = (int)msg["id"];
                     try
                     {
-                        string msgCode = msg.GetField("code").str;
+                        string msgCode = (string)msg["code"];
                         if (RAPI.GetLocalPlayer() != null && events[msgCode].IsReady)
                         {
-                            RequestType msgType = (RequestType)msg.GetField("type").n;
+                            RequestType msgType = (RequestType)(int)msg["type"];
                             string strMsg = "";
                             bool flag = true;
                             if (msgType == RequestType.Start)
                             {
-                                eventRequest = (msgID, msg.GetField("viewer").str, msg.HasField("duration") ? Mathf.RoundToInt(msg.GetField("duration").f) : 0);
+                                eventRequest = (msgID, (string)msg["viewer"], msg.TryGetValue("duration",out var dur) ? Mathf.RoundToInt((float)dur) : 0);
                                 flag = !ExecuteEvent(msgCode);
                                 eventRequest = null;
                                 strMsg = "Event was executed";
@@ -277,7 +253,7 @@ namespace CrowdControl
                                 if (msgCode == "changeWind")
                                 {
                                     windDirection.w = 0;
-                                    new Message_Wind(0, 0).Message.Broadcast(MessageType.Channel);
+                                    new Message_Wind(0, 0).Broadcast();
                                 }
                                 strMsg = "Event is not running";
                             }
@@ -296,6 +272,8 @@ namespace CrowdControl
                     }
                     if (responce != null)
                     {
+                        if (logNetworking)
+                            Debug.Log("Sending responce\n" + Encoding.UTF8.GetString(responce));
                         byte[] final = new byte[responce.Length + 1];
                         responce.CopyTo(final, 0);
                         stream.Write(final, 0, final.Length);
@@ -538,7 +516,7 @@ namespace CrowdControl
             {
                 Network_Host_Entities entity = ComponentManager<Network_Host_Entities>.Value;
                 AI_NetworkBehaviour anb = entity.CreateAINetworkBehaviour(AI_NetworkBehaviourType.Shark, entity.GetSharkSpawnPosition());
-                if (eventRequest.sender.m_SteamID == 0)
+                if (eventRequest.sender == 0)
                     spawnedAnimals.Add(new AnimalEffect(eventRequest.messageId, eventRequest.viewerName, (int)anb.ObjectIndex));
                 if (logNetworking)
                     Debug.Log("shark spawned, sending reply");
@@ -546,7 +524,7 @@ namespace CrowdControl
             }
             else
             {
-                if (eventRequest.sender.m_SteamID == 0)
+                if (eventRequest.sender == 0)
                     spawnedAnimals.Add(new AnimalEffect(eventRequest.messageId, eventRequest.viewerName, -1));
                 sendRequest("spawnShark");
             }
@@ -572,7 +550,7 @@ namespace CrowdControl
 
         public static void changeHealth(float amount)
         {
-            RAPI.GetLocalPlayer().Stats.Damage(-amount, RAPI.GetLocalPlayer().PersonController.transform.position, Vector3.up, EntityType.Environment);
+            RAPI.GetLocalPlayer().Stats.Damage(-amount, RAPI.GetLocalPlayer().PersonController.transform.position, Vector3.up, EntityType.Environment, false);
         }
 
         public static void changeHunger(float amount)
@@ -711,7 +689,7 @@ namespace CrowdControl
             if (Raft_Network.IsHost)
             {
                 AI_NetworkBehaviour anb = spawnAnimal(animal);
-                if (eventRequest.sender.m_SteamID == 0)
+                if (eventRequest.sender == 0)
                     spawnedAnimals.Add(new AnimalEffect(eventRequest.messageId, eventRequest.viewerName, (int)anb.ObjectIndex));
                 if (logNetworking)
                     Debug.Log(animal + " spawned, sending reply");
@@ -807,14 +785,14 @@ namespace CrowdControl
                     blocks.Add(block);
             Block block_Foundation = blocks[(int)(rand.NextDouble() * blocks.Count)];
             block_Foundation.Reinforced = true;
-            new Message_Upgrade(block_Foundation.ObjectIndex).Message.Broadcast(MessageType.Channel);
+            new Message_Upgrade(block_Foundation.ObjectIndex).Broadcast();
         }
 
         public static void randomizeWind(float duration)
         {
             double angle = rand.NextDouble() * 2 * Math.PI;
             windDirection = new Vector4((float)Math.Sin(angle), 0, (float)Math.Cos(angle), duration);
-            new Message_Wind((float)angle, 120).Message.Broadcast(MessageType.Channel);
+            new Message_Wind((float)angle, 120).Broadcast();
         }
 
         public static void changeHat()
@@ -848,8 +826,8 @@ namespace CrowdControl
             Message_NetworkEntity_Damage message = new Message_NetworkEntity_Damage(Messages.DamageEntity, network.NetworkIDManager, ComponentManager<Network_Host_Entities>.Value.ObjectIndex, target.ObjectIndex, target.stat_health.Value, target.transform.position, Vector3.up, EntityType.Environment, null);
             if (Raft_Network.IsHost)
             {
-                target.Damage(message.damage, message.HitPosition, message.HitNormal, message.damageInflictorEntityType, null);
-                RAPI.SendNetworkMessage(message);
+                target.Damage(message.damage, message.HitPosition, message.HitNormal, message.damageInflictorEntityType, false, null);
+                network.RPC(message, Target.Other, EP2PSend.k_EP2PSendReliable, NetworkChannel.Channel_Game);
             }
             else
                 network.SendP2P(network.HostID, message, EP2PSend.k_EP2PSendReliable, NetworkChannel.Channel_Game);
@@ -1107,7 +1085,7 @@ namespace CrowdControl
         {
             List<Slot> items = new List<Slot>();
             foreach (Slot item in player.Inventory.allSlots)
-                if (item.active && item.HasValidItemInstance() && item.itemInstance.settings_consumeable.FoodType == FoodType.None && item.itemInstance.BaseItemMaxUses > 1)
+                if (item.active && item.HasValidItemInstance() && item.itemInstance.settings_consumeable.FoodType == FoodType.None && item.itemInstance.BaseItemMaxUses > 1 && !item.itemInstance.HasMaxUses)
                     items.Add(item);
             Slot Target = items[Main.rand.Next(items.Count - 1)];
             Target.IncrementUses(Target.itemInstance.BaseItemMaxUses - Target.itemInstance.Uses);
@@ -1155,7 +1133,7 @@ namespace CrowdControl
                 new Message_Sail_Rotate(Messages.Sail_Rotate, sail, amount).Broadcast();
         }
 
-        public static void Broadcast(this Message message, NetworkChannel channel = 0)
+        public static void Broadcast(this Message message, NetworkChannel channel = NetworkChannel.Channel_Game)
         {
             var network = ComponentManager<Raft_Network>.Value;
             if (Main.logNetworking)
@@ -1166,171 +1144,114 @@ namespace CrowdControl
                 network.SendP2P(network.HostID, message, EP2PSend.k_EP2PSendReliable, channel);
         }
 
-        public static void SendP2P(this Message message, CSteamID steamID, NetworkChannel channel = 0)
+        public static void SendP2P(this Message message, Network_UserId userID, NetworkChannel channel = NetworkChannel.Channel_Game)
         {
             if (Main.logNetworking)
-                Debug.Log($"sending message to player {steamID.m_SteamID} on channel {channel}");
-            ComponentManager<Raft_Network>.Value.SendP2P(steamID, message, EP2PSend.k_EP2PSendReliable, channel);
-        }
-
-        public static string String(this byte[] bytes, int length = -1, int offset = 0)
-        {
-            string str = "";
-            if (length == -1)
-                length = (bytes.Length - offset) / 2;
-            while (str.Length < length)
-            {
-                str += BitConverter.ToChar(bytes, offset + str.Length * 2);
-            }
-            return str;
-
-        }
-        public static string String(this List<byte> bytes) => bytes.ToArray().String();
-        public static byte[] Bytes(this string str)
-        {
-            var data = new List<byte>();
-            foreach (char chr in str)
-                data.AddRange(BitConverter.GetBytes(chr));
-            return data.ToArray();
-        }
-        public static int Integer(this byte[] bytes, int offset = 0) => BitConverter.ToInt32(bytes, offset);
-        public static uint UInteger(this byte[] bytes, int offset = 0) => BitConverter.ToUInt32(bytes, offset);
-        public static float Float(this byte[] bytes, int offset = 0) => BitConverter.ToSingle(bytes, offset);
-        public static Vector3 Vector3(this byte[] bytes, int offset = 0) => new Vector3(bytes.Float(offset), bytes.Float(offset + 4), bytes.Float(offset + 8));
-        public static byte[] Bytes(this int value) => BitConverter.GetBytes(value);
-        public static byte[] Bytes(this uint value) => BitConverter.GetBytes(value);
-        public static byte[] Bytes(this float value) => BitConverter.GetBytes(value);
-        public static byte[] Bytes(this Vector3 value)
-        {
-            var data = new byte[12];
-            value.x.Bytes().CopyTo(data, 0);
-            value.y.Bytes().CopyTo(data, 4);
-            value.z.Bytes().CopyTo(data, 8);
-            return data;
+                Debug.Log($"sending message to player {userID.Id} on channel {channel}");
+            ComponentManager<Raft_Network>.Value.SendP2P(userID, message, EP2PSend.k_EP2PSendReliable, channel);
         }
     }
-    public struct MessageType
+
+    [Serializable]
+    public abstract class CustomMessage
     {
-        public const int ChannelID = 142;
-        public const NetworkChannel Channel = (NetworkChannel)ChannelID;
-        public const Messages MessageID = (Messages)88;
-        public const int Execute = 0;
-        public const int Executed = 1;
-        public const int Wind = 2;
-        public const int Upgrade = 3;
+        public abstract void Execute(Network_UserId from);
+
+
+        public void Broadcast()
+        {
+            var network = ComponentManager<Raft_Network>.Value;
+            if (Main.logNetworking)
+                Debug.Log($"broadcasting mod message as {(Raft_Network.IsHost ? "host" : "client")} (host id is: {network.HostID})");
+            if (Raft_Network.IsHost)
+                Main.instance.SendNetworkMessage(this, Target.Other, EP2PSend.k_EP2PSendReliable);
+            else
+                Main.instance.SendNetworkMessageToPlayer(this, network.HostID, EP2PSend.k_EP2PSendReliable);
+        }
+
+        public void SendP2P(Network_UserId userID)
+        {
+            if (Main.logNetworking)
+                Debug.Log($"sending mod message to player {userID.Id}");
+            Main.instance.SendNetworkMessageToPlayer(this, userID, EP2PSend.k_EP2PSendReliable);
+        }
     }
 
-    class Message_ExecuteEvent
+    [Serializable]
+    public class Message_ExecuteEvent : CustomMessage
     {
-        public Message_InitiateConnection Message
-        {
-            get
-            {
-                var data = new List<byte>();
-                data.AddRange(eventID.Bytes());
-                data.AddRange(messageID.Bytes());
-                data.AddRange(duration.Bytes());
-                return new Message_InitiateConnection(MessageType.MessageID, MessageType.Execute, data.String());
-            }
-        }
-        public int EventID { get { return eventID; } }
-        public int MessageID { get { return messageID; } }
-        public float Duration { get { return messageID; } }
-        int eventID;
-        int messageID;
-        float duration;
+        public readonly int eventID;
+        public readonly int messageID;
+        public readonly float duration;
         public Message_ExecuteEvent(int eventId, int messageId, float duration)
         {
             eventID = eventId;
             messageID = messageId;
             this.duration = duration;
         }
-        public Message_ExecuteEvent(Message_InitiateConnection message)
+        public override void Execute(Network_UserId from)
         {
-            var data = message.password.Bytes();
-            eventID = data.Integer(0);
-            messageID = data.Integer(4);
-            duration = data.Float(8);
+            if (messageID > -1)
+                eventRequest = (from, messageID, duration);
+            ExecuteEvent(eventID);
+            eventRequest = null;
         }
     }
 
-    class Message_EventExecuted
+    [Serializable]
+    public class Message_EventExecuted : CustomMessage
     {
-        public Message_InitiateConnection Message
-        {
-            get
-            {
-                var data = new List<byte>();
-                data.AddRange(messageID.Bytes());
-                data.AddRange(extra.Bytes());
-                return new Message_InitiateConnection(MessageType.MessageID, MessageType.Executed, data.String());
-            }
-        }
-        public int MessageID { get { return messageID; } }
-        public int ExtraData { get { return extra; } }
-        int messageID;
-        int extra;
+        public readonly int messageID;
+        public readonly int extra;
         public Message_EventExecuted(int messageId, int extraData = -1)
         {
             messageID = messageId;
             extra = extraData;
         }
-        public Message_EventExecuted(Message_InitiateConnection message)
+        public override void Execute(Network_UserId from)
         {
-            var data = message.password.Bytes();
-            messageID = data.Integer(0);
-            extra = data.Integer(4);
+            if (!client.Connected)
+                return;
+            if (logNetworking)
+                Debug.Log("Recieved event reply");
+            foreach (AnimalEffect item in spawnedAnimals)
+                if (item.id == messageID)
+                    item.animalId = extra;
+            byte[] responce = Encoding.UTF8.GetBytes("{\"id\":" + messageID + ",\"status\":" + (int)EffectResult.Success + ",\"message\":\"Event was executed\",\"type\":0}");
+            byte[] final = new byte[responce.Length + 1];
+            responce.CopyTo(final, 0);
+            if (client.Connected)
+                stream.Write(final, 0, final.Length);
         }
     }
 
-    class Message_Wind
+    [Serializable]
+    public class Message_Wind : CustomMessage
     {
-        public Message_InitiateConnection Message
-        {
-            get
-            {
-                var data = new List<byte>();
-                data.AddRange(angle.Bytes());
-                data.AddRange(time.Bytes());
-                return new Message_InitiateConnection(MessageType.MessageID, MessageType.Wind, data.String());
-            }
-        }
-        public float Angle { get { return angle; } }
-        public float Time { get { return time; } }
-        public float angle;
-        public float time;
+        public readonly float angle;
+        public readonly float time;
         public Message_Wind(float Angle, float Time)
         {
             angle = Angle;
             time = Time;
         }
-        public Message_Wind(Message_InitiateConnection message)
+        public override void Execute(Network_UserId from)
         {
-            var data = message.password.Bytes();
-            angle = data.Float(0);
-            time = data.Float(4);
+            windDirection = new Vector4((float)Math.Sin(angle), 0, (float)Math.Cos(angle), time);
         }
     }
 
-    class Message_Upgrade
+    [Serializable]
+    public class Message_Upgrade : CustomMessage
     {
-        public Message_InitiateConnection Message
-        {
-            get
-            {
-                return new Message_InitiateConnection(MessageType.MessageID, MessageType.Upgrade, objectIndex.Bytes().String());
-            }
-        }
-        public uint ObjectIndex { get { return objectIndex; } }
-        uint objectIndex;
+        public readonly uint objectIndex;
         public Message_Upgrade(uint ObjectIndex)
         {
             objectIndex = ObjectIndex;
         }
-        public Message_Upgrade(Message_InitiateConnection message)
+        public override void Execute(Network_UserId from)
         {
-            var data = message.password.Bytes();
-            objectIndex = data.UInteger(0);
+            BlockCreator.GetPlacedBlocks().Find((Block b) => b.ObjectIndex == objectIndex).Reinforced = true;
         }
     }
 
@@ -1540,15 +1461,15 @@ namespace CrowdControl
         {
             var code = instructions.ToList();
             code.InsertRange(code.FindIndex(x => x.opcode == OpCodes.Stloc_0) - 1, new[] {
-            new CodeInstruction(OpCodes.Ldarg_0),
-            new CodeInstruction(OpCodes.Call,AccessTools.Method(typeof(Patch_Camera),"Edit"))
+                new CodeInstruction(OpCodes.Ldarg_0),
+                new CodeInstruction(OpCodes.Call,AccessTools.Method(typeof(Patch_Camera),nameof(Edit)))
             });
             return code;
         }
         static void Edit(EZCameraShake.CameraShaker instance)
         {
             if (flip)
-                Traverse.Create(instance).Field("rotAddShake").SetValue(Traverse.Create(instance).Field("rotAddShake").GetValue<Vector3>() + new Vector3(0, 0, 180));
+                instance.rotAddShake += new Vector3(0, 0, 180);
         }
     }
 
@@ -1848,29 +1769,29 @@ namespace CrowdControl
 
     public class EventRequest
     {
-        public CSteamID sender = new CSteamID(0L);
+        public Network_UserId sender = default;
         public int messageId = -1;
         public string viewerName = "";
         public float duration;
-        public static implicit operator EventRequest((CSteamID sender, int messageId) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId };
-        public static implicit operator EventRequest((CSteamID sender, int messageId, string viewerName) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId, string viewerName) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId, viewerName = tuple.viewerName };
-        public static implicit operator EventRequest((CSteamID sender, int messageId, string viewerName, int duration) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId, string viewerName, int duration) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId, viewerName = tuple.viewerName, duration = tuple.duration / 1000f };
         public static implicit operator EventRequest((int messageId, string viewerName) tuple)
             => new EventRequest() { messageId = tuple.messageId, viewerName = tuple.viewerName };
-        public static implicit operator EventRequest((CSteamID sender, string viewerName) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, string viewerName) tuple)
             => new EventRequest() { sender = tuple.sender, viewerName = tuple.viewerName };
         public static implicit operator EventRequest(string viewerName)
             => new EventRequest() { viewerName = viewerName };
-        public static implicit operator EventRequest((CSteamID sender, int messageId, string viewerName, float duration) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId, string viewerName, float duration) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId, viewerName = tuple.viewerName, duration = tuple.duration };
-        public static implicit operator EventRequest((CSteamID sender, int messageId, float duration) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId, float duration) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId, duration = tuple.duration };
         public static implicit operator EventRequest((int messageId, string viewerName, float duration) tuple)
             => new EventRequest() { messageId = tuple.messageId, viewerName = tuple.viewerName, duration = tuple.duration };
-        public static implicit operator EventRequest((CSteamID sender, int messageId, int duration) tuple)
+        public static implicit operator EventRequest((Network_UserId sender, int messageId, int duration) tuple)
             => new EventRequest() { sender = tuple.sender, messageId = tuple.messageId, duration = tuple.duration / 1000f };
         public static implicit operator EventRequest((int messageId, string viewerName, int duration) tuple)
             => new EventRequest() { messageId = tuple.messageId, viewerName = tuple.viewerName, duration = tuple.duration / 1000f };
